@@ -7,7 +7,7 @@
   <head>
     <meta charset="utf-8">
     <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
-    <title>LCO Observation Portal | {% block title %}{% endblock %}</title>
+    <title>IAG Observation Portal | {% block title %}{% endblock %}</title>
     <meta name="description" content="">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <link rel="apple-touch-icon" href="https://cdn.lco.global/mainstyle/img/favicon.png">
@@ -23,7 +23,7 @@
     <div id="wrapper">
       <nav class="navbar navbar-expand-md navbar-dark navbar-bg">
           <div class="container">
-            <a href="https://lco.global" title="LCO.global" rel="home" class="navbar-brand"><img src="{% static 'iag-logo.png' %}" alt="Institut für Astrophysik Göttingen" class="img-fluid" /></a>
+            <a href="http://www.astro.physik.uni-goettingen.de/" title="IAG" rel="home" class="navbar-brand"><img src="{% static 'iag-logo.png' %}" alt="Institut für Astrophysik Göttingen" class="img-fluid" /></a>
               <button class="navbar-toggler my-2" type="button" data-toggle="collapse" data-target="#navbarCollapse">
                   <span class="navbar-toggler-icon"></span>
               </button>
@@ -35,7 +35,6 @@
                     <li class="nav-item"><a class="nav-link" href="{% url 'requestgroups:list' %}">Home</a></li>
                     <li class="nav-item"><a class="nav-link" href="{% url 'requestgroups:create' %}">Submit Observation</a></li>
                     <li class="nav-item"><a class="nav-link" href="{% url 'proposals:list' %}?active=True">Manage Proposals</a></li>
-                    <li class="nav-item"><a class="nav-link" href="https://lco.global/observatory/tools/">Planning Tools</a></li>
                     <li class="nav-item"><a class="nav-link" href="{% url 'help' %}">Help</a></li>
 
                     {% if user.is_authenticated %}
