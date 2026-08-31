@@ -48,13 +48,26 @@ class ObservationPortalOIDCBackend(OIDCAuthenticationBackend):
         # (_verify_jws) explicitly skips aud checking (`verify_aud: False`), so this is still a
         # net improvement, just not a guarantee for providers whose userinfo omits aud.
         aud = claims.get('aud')
-        if aud is None:
-            return True
-        if isinstance(aud, str):
-            aud = [aud]
-        if self.OIDC_RP_CLIENT_ID not in aud:
-            logger.warning('OIDC login rejected: aud claim does not include our client id')
-            return False
+        if aud is not None:
+            if isinstance(aud, str):
+                aud = [aud]
+            if self.OIDC_RP_CLIENT_ID not in aud:
+                logger.warning('OIDC login rejected: aud claim does not include our client id')
+                return False
+
+        # Optional group-based authorization gate (mirrors pyobs-auth's REQUIRED_GROUPS): unset
+        # -> every authenticated identity is allowed, matching today's default. Checked on every
+        # login, not just account creation, so someone who's since left the group is rejected on
+        # their next login too, not just blocked from minting a new account. Requires a "Group
+        # Membership" mapper on the OIDC client with "Add to userinfo" enabled -- claims here
+        # come from the userinfo endpoint, not the ID/access token.
+        required_groups = getattr(settings, 'OIDC_REQUIRED_GROUPS', ())
+        if required_groups:
+            groups = set(claims.get('groups') or [])
+            if not all(group in groups for group in required_groups):
+                logger.warning('OIDC login rejected: missing required group membership')
+                return False
+
         return True
 
     def create_user(self, claims):

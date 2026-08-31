@@ -59,6 +59,39 @@ class TestObservationPortalOIDCBackend(DramatiqTestCase):
     def test_verify_claims_rejects_missing_email(self):
         self.assertFalse(self.backend.verify_claims({'aud': 'test-client'}))
 
+    def test_verify_claims_no_required_groups_configured_allows_any_groups(self):
+        # OIDC_REQUIRED_GROUPS unset in OIDC_TEST_SETTINGS -- default behavior, gate never applies.
+        self.assertTrue(self.backend.verify_claims({'email': 'a@example.com', 'groups': []}))
+        self.assertTrue(self.backend.verify_claims({'email': 'a@example.com'}))
+
+    @override_settings(**OIDC_TEST_SETTINGS, OIDC_REQUIRED_GROUPS=['/monet-iag50'])
+    def test_verify_claims_accepts_member_of_required_group(self):
+        self.assertTrue(self.backend.verify_claims(
+            {'email': 'a@example.com', 'groups': ['/monet-iag50', '/something-else']},
+        ))
+
+    @override_settings(**OIDC_TEST_SETTINGS, OIDC_REQUIRED_GROUPS=['/monet-iag50'])
+    def test_verify_claims_rejects_non_member(self):
+        self.assertFalse(self.backend.verify_claims(
+            {'email': 'a@example.com', 'groups': ['/something-else']},
+        ))
+
+    @override_settings(**OIDC_TEST_SETTINGS, OIDC_REQUIRED_GROUPS=['/monet-iag50'])
+    def test_verify_claims_rejects_missing_groups_claim(self):
+        # No "Group Membership" mapper configured on the client (or not added to userinfo) --
+        # must fail closed, not silently allow everyone through.
+        self.assertFalse(self.backend.verify_claims({'email': 'a@example.com'}))
+
+    @override_settings(**OIDC_TEST_SETTINGS, OIDC_REQUIRED_GROUPS=['/monet-iag50', '/observers'])
+    def test_verify_claims_requires_all_configured_groups(self):
+        # AND, not OR -- matches pyobs-auth's REQUIRED_GROUPS semantics.
+        self.assertFalse(self.backend.verify_claims(
+            {'email': 'a@example.com', 'groups': ['/monet-iag50']},
+        ))
+        self.assertTrue(self.backend.verify_claims(
+            {'email': 'a@example.com', 'groups': ['/monet-iag50', '/observers']},
+        ))
+
     def test_create_user_mints_inactive_user_with_empty_profile(self):
         claims = {'email': 'newperson@example.com', 'sub': 'abc-123'}
         user = self.backend.create_user(claims)

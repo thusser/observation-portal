@@ -242,6 +242,12 @@ if OIDC_ENABLED:
     # Cosmetic only -- shown on the login button ("Log in with {label}"); has no bearing on which
     # provider is actually contacted (that's entirely the OIDC_OP_* endpoints above).
     OIDC_PROVIDER_LABEL = os.getenv('OIDC_PROVIDER_LABEL', 'OIDC')
+    # Optional authorization gate: unset/empty -> every identity the OP authenticates is allowed
+    # to mint/use a portal account (today's default). Set -> only claims naming ALL of these full
+    # group paths (Keycloak's `groups` claim, e.g. "/monet-iag50") pass; checked on every login,
+    # not just first-time account creation. See accounts/oidc.py's verify_claims for the
+    # userinfo-vs-token-claims caveat (needs "Add to userinfo" on the client's group mapper).
+    OIDC_REQUIRED_GROUPS = get_list_from_env('OIDC_REQUIRED_GROUPS')
 
     AUTHENTICATION_BACKENDS = AUTHENTICATION_BACKENDS + [
         'observation_portal.accounts.oidc.ObservationPortalOIDCBackend',
