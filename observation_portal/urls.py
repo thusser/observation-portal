@@ -127,6 +127,9 @@ urlpatterns = [
     ), name='redoc'),
 ]
 
+if settings.OIDC_ENABLED:
+    urlpatterns += [path("oidc/", include("mozilla_django_oidc.urls"))]
+
 if settings.DEBUG:
     urlpatterns += staticfiles_urlpatterns()
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

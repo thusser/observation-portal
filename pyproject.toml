@@ -47,6 +47,7 @@ django-redis-cache = "^3"
 django-registration-redux = "^2.9"
 django-object-actions = "^5.1.2"
 django-storages = "^1.14"
+mozilla-django-oidc = {version = "^5.0.2", extras = ["drf"], python = ">=3.10,<3.12"}
 dramatiq = { version = "^1.12", extras = [ "redis", "watch" ] }
 drf-yasg = "^1.20"
 opensearch-py = ">=1.0,<2.0"

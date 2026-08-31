@@ -7,6 +7,7 @@
 !./poetry.lock
 !./observation_portal/
 !./manage.py
+!./templates/
 
 # but stil ignore the following recursively
 **/*.swp
