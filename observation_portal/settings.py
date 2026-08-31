@@ -227,6 +227,14 @@ if OIDC_ENABLED:
     OIDC_OP_JWKS_ENDPOINT = os.environ['OIDC_OP_JWKS_ENDPOINT']
     OIDC_RP_SIGN_ALGO = os.getenv('OIDC_RP_SIGN_ALGO', 'RS256')
     OIDC_RP_SCOPES = os.getenv('OIDC_RP_SCOPES', 'openid email')
+    # Every bearer token that isn't a portal-issued OAuth2 token reaches this endpoint (see
+    # DEFAULT_AUTHENTICATION_CLASSES below) -- an unbounded default here means a slow/unreachable
+    # OP can hang API workers indefinitely on nothing more than a garbage Authorization header.
+    OIDC_TIMEOUT = int(os.getenv('OIDC_TIMEOUT', '5'))
+    # Needed for oidc_op_logout_url (below) to be able to pass id_token_hint on RP-Initiated
+    # Logout -- without this the ID token is never kept, so the hint would silently never be
+    # sent even when OIDC_OP_LOGOUT_ENDPOINT is configured.
+    OIDC_STORE_ID_TOKEN = True
     # Optional: only providers that expose RP-Initiated Logout need this (see accounts/oidc.py's
     # oidc_op_logout_url). Left unset, /oidc/logout/ still ends the local Django session.
     OIDC_OP_LOGOUT_ENDPOINT = os.getenv('OIDC_OP_LOGOUT_ENDPOINT', '')
@@ -343,12 +351,14 @@ REST_FRAMEWORK = {
 
 if OIDC_ENABLED:
     # Must come after OAuth2Authentication: DRF uses the first authenticator that returns a
-    # non-None result, and mozilla-django-oidc's DRF authenticator validates every bearer token it
-    # sees against the OIDC provider's userinfo endpoint over the network (no cheap local
-    # issuer-based defer) -- this ordering is what keeps portal-issued OAuth2 tokens from ever
-    # reaching it.
+    # non-None result, and the OIDC authenticator validates every bearer token it sees against
+    # the OIDC provider's userinfo endpoint over the network (no cheap local issuer-based defer)
+    # -- this ordering is what keeps portal-issued OAuth2 tokens from ever reaching it.
+    # ObservationPortalOIDCAuthentication, not mozilla_django_oidc's own class directly: it wraps
+    # transport-level failures (timeout, connection refused) as AuthenticationFailed instead of
+    # letting them propagate as a 500.
     REST_FRAMEWORK['DEFAULT_AUTHENTICATION_CLASSES'] = REST_FRAMEWORK['DEFAULT_AUTHENTICATION_CLASSES'] + (
-        'mozilla_django_oidc.contrib.drf.OIDCAuthentication',
+        'observation_portal.accounts.oidc.ObservationPortalOIDCAuthentication',
     )
 
 LOGGING = {

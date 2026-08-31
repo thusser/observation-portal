@@ -2,6 +2,12 @@
 {% block content %}
 {% if user.is_authenticated %}
 <div>You are logged in as {{ user.username }}</div>
+{% if oidc_login_enabled %}
+<form method="post" action="{% url 'oidc_logout' %}">
+    {% csrf_token %}
+    <button type="submit">Log out</button>
+</form>
+{% endif %}
 {% else %}
 <div>You are logged out</div>
 {% endif %}

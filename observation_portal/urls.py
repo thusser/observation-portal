@@ -128,9 +128,7 @@ urlpatterns = [
 ]
 
 if settings.OIDC_ENABLED:
-    # Must precede the accounts/ include: accounts/urls.py ends in a catch-all
-    # (registration.backends.default.urls) that would otherwise swallow oidc/... and 404 it.
-    urlpatterns = [path("oidc/", include("mozilla_django_oidc.urls"))] + urlpatterns
+    urlpatterns += [path("oidc/", include("mozilla_django_oidc.urls"))]
 
 if settings.DEBUG:
     urlpatterns += staticfiles_urlpatterns()

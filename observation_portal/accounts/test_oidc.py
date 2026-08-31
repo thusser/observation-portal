@@ -2,14 +2,16 @@ import responses
 from django.test import RequestFactory, TestCase, override_settings
 from django.urls import reverse
 from django_dramatiq.test import DramatiqTestCase
-from mozilla_django_oidc.contrib.drf import OIDCAuthentication
 from oauth2_provider.contrib.rest_framework import OAuth2Authentication
 from oauth2_provider.models import AccessToken, Application
 from django.utils import timezone
 from datetime import timedelta
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from rest_framework.exceptions import AuthenticationFailed
 from rest_framework.request import Request
 
-from observation_portal.accounts.oidc import ObservationPortalOIDCBackend
+from observation_portal.accounts.models import Profile
+from observation_portal.accounts.oidc import ObservationPortalOIDCAuthentication, ObservationPortalOIDCBackend
 from observation_portal.accounts.test_utils import blend_user
 
 OIDC_AUTHENTICATION_BACKENDS = [
@@ -67,6 +69,15 @@ class TestObservationPortalOIDCBackend(DramatiqTestCase):
         self.assertEqual(user.profile.title, '')
         self.assertEqual(user.profile.oidc_sub, 'abc-123')
 
+    def test_create_user_stores_none_not_empty_string_for_missing_sub(self):
+        # sub is mandatory per spec, so this only happens against a non-compliant provider -- but
+        # Profile.oidc_sub is unique, so a second such user must not collide on ''.
+        first = self.backend.create_user({'email': 'one@example.com'})
+        second = self.backend.create_user({'email': 'two@example.com'})
+
+        self.assertIsNone(first.profile.oidc_sub)
+        self.assertIsNone(second.profile.oidc_sub)
+
     def test_filter_users_by_claims_matches_by_sub_first(self):
         user = blend_user(profile_params={'oidc_sub': 'sub-1'})
         # a different user matches by email too -- sub match must win, not raise on multiple matches
@@ -82,6 +93,15 @@ class TestObservationPortalOIDCBackend(DramatiqTestCase):
         matches = self.backend.filter_users_by_claims({'sub': 'unseen-sub', 'email': user.email})
 
         self.assertEqual(list(matches), [user])
+
+    def test_filter_users_by_claims_rejects_unverified_email(self):
+        user = blend_user(profile_params={'oidc_sub': ''})
+
+        matches = self.backend.filter_users_by_claims(
+            {'sub': 'unseen-sub', 'email': user.email, 'email_verified': False},
+        )
+
+        self.assertEqual(list(matches), [])
 
     def test_update_user_stores_sub_on_first_oidc_login(self):
         user = blend_user(profile_params={'oidc_sub': ''})
@@ -101,18 +121,53 @@ class TestObservationPortalOIDCBackend(DramatiqTestCase):
         user.refresh_from_db()
         self.assertEqual(user.profile.oidc_sub, 'already-set')
 
+    def test_update_user_does_not_crash_for_user_without_profile(self):
+        # e.g. an account created via createsuperuser, which doesn't go through the
+        # Profile-creating registration flow.
+        user = self.backend.UserModel.objects.create_user('admin', email='admin@example.com')
+        self.assertFalse(Profile.objects.filter(user=user).exists())
+
+        result = self.backend.update_user(user, {'sub': 'some-sub'})
+
+        self.assertEqual(result, user)
+        self.assertFalse(Profile.objects.filter(user=user).exists())
+
+    def test_get_or_create_user_returns_none_for_inactive_match(self):
+        user = blend_user(user_params={'is_active': False}, profile_params={'oidc_sub': 'inactive-sub'})
+        # get_or_create_user (base class) fetches claims via a live userinfo call regardless of
+        # what's passed as `payload` -- it only uses payload for the browser/ID-token flow.
+        responses.add(
+            responses.GET, 'https://op.example.com/userinfo',
+            json={'sub': 'inactive-sub', 'email': user.email}, status=200,
+        )
+
+        result = self.backend.get_or_create_user('token', None, None)
+
+        self.assertIsNone(result)
+
+    def test_get_or_create_user_returns_active_match(self):
+        user = blend_user(profile_params={'oidc_sub': 'active-sub'})
+        responses.add(
+            responses.GET, 'https://op.example.com/userinfo',
+            json={'sub': 'active-sub', 'email': user.email}, status=200,
+        )
+
+        result = self.backend.get_or_create_user('token', None, None)
+
+        self.assertEqual(result, user)
+
 
 class TestOIDCDRFAuthenticationStacking(TestCase):
     """Authenticator-order stacking, as it would be with OIDC_ENABLED=True.
 
-    Exercises OAuth2Authentication/OIDCAuthentication directly against a DRF Request (rather than
-    hitting a real view through the test client): DRF views bind `authentication_classes` from
-    api_settings.DEFAULT_AUTHENTICATION_CLASSES once, at class-definition time (during app
-    startup, well before any test's override_settings runs) -- REST_FRAMEWORK isn't one of the
-    settings override_settings can retroactively change on an already-defined view (DRF's own
-    APISettings docstring: "test helpers like override_settings may not work as expected"). Going
-    straight at the authenticators sidesteps that and tests the actual thing this stacking depends
-    on: authenticator order, not view configuration.
+    Exercises OAuth2Authentication/ObservationPortalOIDCAuthentication directly against a DRF
+    Request (rather than hitting a real view through the test client): DRF views bind
+    `authentication_classes` from api_settings.DEFAULT_AUTHENTICATION_CLASSES once, at
+    class-definition time (during app startup, well before any test's override_settings runs) --
+    REST_FRAMEWORK isn't one of the settings override_settings can retroactively change on an
+    already-defined view (DRF's own APISettings docstring: "test helpers like override_settings
+    may not work as expected"). Going straight at the authenticators sidesteps that and tests the
+    actual thing this stacking depends on: authenticator order, not view configuration.
     """
 
     def setUp(self):
@@ -121,8 +176,8 @@ class TestOIDCDRFAuthenticationStacking(TestCase):
 
     @staticmethod
     def _authenticators():
-        # matches settings.py's ordering: OAuth2Authentication before OIDCAuthentication.
-        return [OAuth2Authentication(), OIDCAuthentication()]
+        # matches settings.py's ordering: OAuth2Authentication before the OIDC authenticator.
+        return [OAuth2Authentication(), ObservationPortalOIDCAuthentication()]
 
     @override_settings(**OIDC_TEST_SETTINGS, AUTHENTICATION_BACKENDS=OIDC_AUTHENTICATION_BACKENDS)
     def test_valid_oidc_bearer_token_authenticates(self):
@@ -135,7 +190,35 @@ class TestOIDCDRFAuthenticationStacking(TestCase):
         request = Request(django_request, authenticators=self._authenticators())
 
         self.assertEqual(request.user, self.user)
-        self.assertIsInstance(request.successful_authenticator, OIDCAuthentication)
+        self.assertIsInstance(request.successful_authenticator, ObservationPortalOIDCAuthentication)
+
+    @override_settings(**OIDC_TEST_SETTINGS, AUTHENTICATION_BACKENDS=OIDC_AUTHENTICATION_BACKENDS)
+    def test_inactive_oidc_user_does_not_authenticate(self):
+        self.user.is_active = False
+        self.user.save(update_fields=['is_active'])
+        responses.add(
+            responses.GET, 'https://op.example.com/userinfo',
+            json={'email': self.user.email, 'sub': 'some-sub'}, status=200,
+        )
+        django_request = self.factory.get('/api/profile/', HTTP_AUTHORIZATION='Bearer some-valid-access-token')
+
+        request = Request(django_request, authenticators=self._authenticators())
+
+        with self.assertRaises(AuthenticationFailed):
+            _ = request.user
+
+    @override_settings(**OIDC_TEST_SETTINGS, AUTHENTICATION_BACKENDS=OIDC_AUTHENTICATION_BACKENDS)
+    def test_transport_failure_raises_authentication_failed_not_500(self):
+        responses.add(
+            responses.GET, 'https://op.example.com/userinfo',
+            body=RequestsConnectionError('connection refused'),
+        )
+        django_request = self.factory.get('/api/profile/', HTTP_AUTHORIZATION='Bearer some-valid-access-token')
+
+        request = Request(django_request, authenticators=self._authenticators())
+
+        with self.assertRaises(AuthenticationFailed):
+            _ = request.user
 
     @override_settings(**OIDC_TEST_SETTINGS, AUTHENTICATION_BACKENDS=OIDC_AUTHENTICATION_BACKENDS)
     def test_portal_oauth2_token_still_authenticates_without_reaching_oidc(self):
@@ -148,7 +231,7 @@ class TestOIDCDRFAuthenticationStacking(TestCase):
             expires=timezone.now() + timedelta(days=1), scope='read',
         )
         # no responses.add() for the userinfo endpoint: if OAuth2Authentication didn't claim this
-        # token first, OIDCAuthentication would attempt an unmocked HTTP call and `responses`
+        # token first, the OIDC authenticator would attempt an unmocked HTTP call and `responses`
         # would raise ConnectionError, failing this test.
         django_request = self.factory.get('/api/profile/', HTTP_AUTHORIZATION=f'Bearer {access_token.token}')
 
@@ -166,4 +249,5 @@ class TestLoginPageWithoutOIDC(TestCase):
         response = self.client.get(reverse('auth_login'))
 
         self.assertEqual(response.status_code, 200)
-        self.assertNotContains(response, 'oidc')
+        self.assertFalse(response.context['oidc_login_enabled'])
+        self.assertNotIn(b'oidc/authenticate', response.content)

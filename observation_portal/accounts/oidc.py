@@ -3,6 +3,9 @@ import logging
 from django.conf import settings
 from django.utils.http import urlencode
 from mozilla_django_oidc.auth import OIDCAuthenticationBackend
+from mozilla_django_oidc.contrib.drf import OIDCAuthentication
+from requests.exceptions import RequestException
+from rest_framework.exceptions import AuthenticationFailed
 
 from observation_portal.accounts.models import Profile
 
@@ -23,6 +26,16 @@ class ObservationPortalOIDCBackend(OIDCAuthenticationBackend):
             matches = self.UserModel.objects.filter(profile__oidc_sub=sub)
             if matches.exists():
                 return matches
+        # Linking an OIDC identity to an *existing* account by email is a trust boundary: if the
+        # OP explicitly says it hasn't verified the email (`email_verified: False`), refuse the
+        # link rather than silently handing that account to whoever controls the address at the
+        # OP. Not every provider sends this claim -- when it's absent we trust the OP verified
+        # it, the same assumption every other email-based account-linking flow makes. This only
+        # gates the email-fallback match below; a brand new account (create_user) carries no
+        # such risk since nothing existing is being linked.
+        if claims.get('email_verified') is False:
+            logger.warning('OIDC login rejected: email_verified is explicitly False')
+            return self.UserModel.objects.none()
         return super().filter_users_by_claims(claims)
 
     def verify_claims(self, claims):
@@ -49,17 +62,57 @@ class ObservationPortalOIDCBackend(OIDCAuthenticationBackend):
         user = self.UserModel.objects.create_user(
             username, email=claims.get('email', ''), is_active=False,
         )
+        # sub is mandatory per the OIDC spec, so an empty value only happens against a
+        # non-compliant provider -- store None, not '', so a second such user doesn't collide
+        # with Profile.oidc_sub's unique constraint.
         Profile.objects.create(
-            user=user, institution='', title='', oidc_sub=claims.get('sub', ''),
+            user=user, institution='', title='', oidc_sub=claims.get('sub') or None,
         )
         return user
 
     def update_user(self, user, claims):
-        sub = claims.get('sub', '')
-        if sub and user.profile.oidc_sub != sub:
-            user.profile.oidc_sub = sub
-            user.profile.save(update_fields=['oidc_sub'])
+        sub = claims.get('sub')
+        if not sub:
+            return user
+        # user.profile can raise RelatedObjectDoesNotExist for accounts that predate the
+        # Profile model requirement (e.g. createsuperuser), which would otherwise 500 a first
+        # OIDC login that happens to email-match one of those.
+        profile = Profile.objects.filter(user=user).first()
+        if profile and profile.oidc_sub != sub:
+            profile.oidc_sub = sub
+            profile.save(update_fields=['oidc_sub'])
         return user
+
+    def get_or_create_user(self, access_token, id_token, payload):
+        """Enforce is_active the same way for every entry point.
+
+        The base implementation returns whatever user filter_users_by_claims/create_user hands
+        back regardless of is_active -- fine for the browser flow, which separately checks
+        is_active before completing login (OIDCAuthenticationCallbackView.login_success), but the
+        DRF flow (ObservationPortalOIDCAuthentication below) has no such check: IsAuthenticated
+        passes for any authenticated user object, active or not. Returning None here for an
+        inactive match makes DRF's contrib.drf.OIDCAuthentication raise AuthenticationFailed
+        instead, matching the browser flow's activation gate.
+        """
+        user = super().get_or_create_user(access_token, id_token, payload)
+        if user and not user.is_active:
+            return None
+        return user
+
+
+class ObservationPortalOIDCAuthentication(OIDCAuthentication):
+    """mozilla-django-oidc's DRF authenticator only catches HTTPError/SuspiciousOperation around
+    the userinfo call -- a transport-level failure (timeout, connection refused, DNS failure)
+    talking to the OIDC provider would otherwise propagate as an uncaught exception (a 500 on
+    what should be a clean auth failure) instead of translating to AuthenticationFailed like
+    every other rejected-credential case."""
+
+    def authenticate(self, request):
+        try:
+            return super().authenticate(request)
+        except RequestException as exc:
+            logger.warning('OIDC userinfo request failed: %s', exc)
+            raise AuthenticationFailed('OIDC provider unreachable')
 
 
 def oidc_op_logout_url(request):
