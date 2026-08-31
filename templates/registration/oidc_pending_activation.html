@@ -1,0 +1,11 @@
+{% extends "registration/registration_base.html" %}
+{% load i18n %}
+{% block title %}{% trans "Account pending activation" %}{% endblock %}
+{% block content %}
+<div class="row">
+    <div class="col-md-6">
+        <h2>{% trans "Account pending activation" %}</h2>
+        <p>{% trans "Your login succeeded, but your account hasn't been activated yet. An administrator needs to activate it before you can use the portal." %}</p>
+    </div>
+</div>
+{% endblock %}

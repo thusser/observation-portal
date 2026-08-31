@@ -248,6 +248,26 @@ if OIDC_ENABLED:
     # not just first-time account creation. See accounts/oidc.py's verify_claims for the
     # userinfo-vs-token-claims caveat (needs "Add to userinfo" on the client's group mapper).
     OIDC_REQUIRED_GROUPS = get_list_from_env('OIDC_REQUIRED_GROUPS')
+    # Optional auto-activation: unset/empty -> every new OIDC account still lands inactive
+    # pending manual admin review (today's default). Set -> claims naming ALL of these full group
+    # paths get is_active=True immediately on creation, skipping that review -- meant for a group
+    # already trusted to have vetted membership. See accounts/oidc.py's create_user.
+    OIDC_AUTO_ACTIVATE_GROUPS = get_list_from_env('OIDC_AUTO_ACTIVATE_GROUPS')
+    # Distinguishes "your account is pending activation" from every other login failure on the
+    # browser flow. See accounts/oidc.py's ObservationPortalOIDCCallbackView.
+    OIDC_CALLBACK_CLASS = 'observation_portal.accounts.oidc.ObservationPortalOIDCCallbackView'
+    # Readable usernames (email local-part) instead of mozilla-django-oidc's default
+    # base64(sha1(email)) -- opaque to anyone looking at the admin/proposals UI otherwise.
+    OIDC_USERNAME_ALGO = 'observation_portal.accounts.oidc.oidc_username_from_email'
+    # PKCE hardens the authorization code exchange against interception; on by default since
+    # there's no real reason to disable it for a confidential client against a provider that
+    # supports it (Keycloak does) -- kept configurable in case some other OP doesn't.
+    OIDC_USE_PKCE = os.getenv('OIDC_USE_PKCE', 'True').lower() == 'true'
+    # Only disable for local/dev providers with self-signed certs -- never in production.
+    OIDC_VERIFY_SSL = os.getenv('OIDC_VERIFY_SSL', 'True').lower() == 'true'
+    _oidc_proxy_url = os.getenv('OIDC_PROXY_URL', '')
+    if _oidc_proxy_url:
+        OIDC_PROXY = {'http': _oidc_proxy_url, 'https': _oidc_proxy_url}
 
     AUTHENTICATION_BACKENDS = AUTHENTICATION_BACKENDS + [
         'observation_portal.accounts.oidc.ObservationPortalOIDCBackend',

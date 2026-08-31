@@ -8,7 +8,10 @@ def oidc(request):
     if not settings.OIDC_ENABLED:
         return {'oidc_login_enabled': False}
 
-    next_url = request.GET.get('next', '')
+    # POST too: after a failed local-password submission the form re-renders via POST, where
+    # `next` (if the login form carried it forward) lives in POST, not GET -- GET-only silently
+    # dropped the redirect destination for the OIDC button on that re-render.
+    next_url = request.POST.get('next') or request.GET.get('next', '')
     login_url = reverse('oidc_authentication_init')
     if next_url:
         login_url = f'{login_url}?{urlencode({"next": next_url})}'

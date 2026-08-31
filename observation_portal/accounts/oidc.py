@@ -1,9 +1,13 @@
 import logging
+import re
 
 from django.conf import settings
+from django.contrib.auth import get_user_model
+from django.shortcuts import render
 from django.utils.http import urlencode
 from mozilla_django_oidc.auth import OIDCAuthenticationBackend
 from mozilla_django_oidc.contrib.drf import OIDCAuthentication
+from mozilla_django_oidc.views import OIDCAuthenticationCallbackView
 from requests.exceptions import RequestException
 from rest_framework.exceptions import AuthenticationFailed
 
@@ -72,8 +76,18 @@ class ObservationPortalOIDCBackend(OIDCAuthenticationBackend):
 
     def create_user(self, claims):
         username = self.get_username(claims)
+        # Mirrors OIDC_REQUIRED_GROUPS's shape and semantics (AND across entries, full group
+        # paths). Unset -> every new account still lands inactive pending manual admin review,
+        # today's default. Set -> members of ALL of these groups are activated immediately on
+        # creation, skipping that review -- meant for a group you already trust to have vetted
+        # membership (e.g. the same one gating OIDC_REQUIRED_GROUPS, or a stricter subset of it).
+        auto_activate_groups = getattr(settings, 'OIDC_AUTO_ACTIVATE_GROUPS', ())
+        is_active = False
+        if auto_activate_groups:
+            groups = set(claims.get('groups') or [])
+            is_active = all(group in groups for group in auto_activate_groups)
         user = self.UserModel.objects.create_user(
-            username, email=claims.get('email', ''), is_active=False,
+            username, email=claims.get('email', ''), is_active=is_active,
         )
         # sub is mandatory per the OIDC spec, so an empty value only happens against a
         # non-compliant provider -- store None, not '', so a second such user doesn't collide
@@ -96,21 +110,38 @@ class ObservationPortalOIDCBackend(OIDCAuthenticationBackend):
             profile.save(update_fields=['oidc_sub'])
         return user
 
-    def get_or_create_user(self, access_token, id_token, payload):
-        """Enforce is_active the same way for every entry point.
 
-        The base implementation returns whatever user filter_users_by_claims/create_user hands
-        back regardless of is_active -- fine for the browser flow, which separately checks
-        is_active before completing login (OIDCAuthenticationCallbackView.login_success), but the
-        DRF flow (ObservationPortalOIDCAuthentication below) has no such check: IsAuthenticated
-        passes for any authenticated user object, active or not. Returning None here for an
-        inactive match makes DRF's contrib.drf.OIDCAuthentication raise AuthenticationFailed
-        instead, matching the browser flow's activation gate.
-        """
-        user = super().get_or_create_user(access_token, id_token, payload)
-        if user and not user.is_active:
-            return None
-        return user
+def oidc_username_from_email(email, claims=None):
+    """OIDC_USERNAME_ALGO: mozilla-django-oidc's default (base64(sha1(email))) produces opaque
+    usernames -- fine for a system that never shows usernames, but this portal's admin/proposals
+    UI does. Uses the email's local part instead, de-duplicated with a numeric suffix on
+    collision (two different domains sharing a local part, or a local-part clash with an
+    existing local-registration username)."""
+    base = re.sub(r'[^a-zA-Z0-9_.@+-]', '', (email or '').split('@')[0]) or 'oidc-user'
+    base = base[:150]
+    UserModel = get_user_model()
+    username = base
+    suffix = 1
+    while UserModel.objects.filter(username=username).exists():
+        suffix += 1
+        username = f'{base}{suffix}'[:150]
+    return username
+
+
+class ObservationPortalOIDCCallbackView(OIDCAuthenticationCallbackView):
+    """OIDC_CALLBACK_CLASS: distinguishes "your account is pending activation" from every other
+    login failure (wrong group, bad state, provider error, etc.), which the base view's generic
+    redirect-to-LOGIN_REDIRECT_URL_FAILURE can't -- it only knows self.user is falsy, not why.
+
+    Renders in place rather than adding a new URL, sidestepping any question of whether that URL
+    would be reachable given the frontend's own routing of /accounts/ and unrouted paths -- /oidc/
+    already reaches this code, unlike most other paths on this site.
+    """
+
+    def login_failure(self):
+        if getattr(self, 'user', None) is not None and not self.user.is_active:
+            return render(self.request, 'registration/oidc_pending_activation.html', status=403)
+        return super().login_failure()
 
 
 class ObservationPortalOIDCAuthentication(OIDCAuthentication):
@@ -118,14 +149,24 @@ class ObservationPortalOIDCAuthentication(OIDCAuthentication):
     the userinfo call -- a transport-level failure (timeout, connection refused, DNS failure)
     talking to the OIDC provider would otherwise propagate as an uncaught exception (a 500 on
     what should be a clean auth failure) instead of translating to AuthenticationFailed like
-    every other rejected-credential case."""
+    every other rejected-credential case.
+
+    Also enforces is_active here rather than in the shared backend: IsAuthenticated passes for
+    any authenticated user object regardless of is_active, so without this an inactive OIDC-minted
+    account holding a valid provider token could hit IsAuthenticated-only endpoints. Kept out of
+    ObservationPortalOIDCBackend.get_or_create_user (unlike an earlier version of this code) so
+    the browser flow's callback view still sees the real (inactive) user object and can render a
+    helpful message instead of a bare failure redirect."""
 
     def authenticate(self, request):
         try:
-            return super().authenticate(request)
+            result = super().authenticate(request)
         except RequestException as exc:
             logger.warning('OIDC userinfo request failed: %s', exc)
             raise AuthenticationFailed('OIDC provider unreachable')
+        if result is not None and not result[0].is_active:
+            raise AuthenticationFailed('Account pending activation')
+        return result
 
 
 def oidc_op_logout_url(request):

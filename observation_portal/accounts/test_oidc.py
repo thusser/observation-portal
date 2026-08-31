@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 import responses
 from django.test import RequestFactory, TestCase, override_settings
 from django.urls import reverse
@@ -10,8 +12,14 @@ from requests.exceptions import ConnectionError as RequestsConnectionError
 from rest_framework.exceptions import AuthenticationFailed
 from rest_framework.request import Request
 
+from observation_portal.accounts.context_processors import oidc as oidc_context_processor
 from observation_portal.accounts.models import Profile
-from observation_portal.accounts.oidc import ObservationPortalOIDCAuthentication, ObservationPortalOIDCBackend
+from observation_portal.accounts.oidc import (
+    ObservationPortalOIDCAuthentication,
+    ObservationPortalOIDCBackend,
+    ObservationPortalOIDCCallbackView,
+    oidc_username_from_email,
+)
 from observation_portal.accounts.test_utils import blend_user
 
 OIDC_AUTHENTICATION_BACKENDS = [
@@ -165,29 +173,25 @@ class TestObservationPortalOIDCBackend(DramatiqTestCase):
         self.assertEqual(result, user)
         self.assertFalse(Profile.objects.filter(user=user).exists())
 
-    def test_get_or_create_user_returns_none_for_inactive_match(self):
-        user = blend_user(user_params={'is_active': False}, profile_params={'oidc_sub': 'inactive-sub'})
-        # get_or_create_user (base class) fetches claims via a live userinfo call regardless of
-        # what's passed as `payload` -- it only uses payload for the browser/ID-token flow.
-        responses.add(
-            responses.GET, 'https://op.example.com/userinfo',
-            json={'sub': 'inactive-sub', 'email': user.email}, status=200,
-        )
+    def test_create_user_lands_inactive_without_auto_activate_groups_configured(self):
+        user = self.backend.create_user({'email': 'a@example.com', 'groups': ['/anything']})
+        self.assertFalse(user.is_active)
 
-        result = self.backend.get_or_create_user('token', None, None)
+    @override_settings(**OIDC_TEST_SETTINGS, OIDC_AUTO_ACTIVATE_GROUPS=['/trusted'])
+    def test_create_user_auto_activates_member_of_configured_group(self):
+        user = self.backend.create_user({'email': 'a@example.com', 'groups': ['/trusted', '/other']})
+        self.assertTrue(user.is_active)
 
-        self.assertIsNone(result)
+    @override_settings(**OIDC_TEST_SETTINGS, OIDC_AUTO_ACTIVATE_GROUPS=['/trusted'])
+    def test_create_user_does_not_auto_activate_non_member(self):
+        user = self.backend.create_user({'email': 'a@example.com', 'groups': ['/other']})
+        self.assertFalse(user.is_active)
 
-    def test_get_or_create_user_returns_active_match(self):
-        user = blend_user(profile_params={'oidc_sub': 'active-sub'})
-        responses.add(
-            responses.GET, 'https://op.example.com/userinfo',
-            json={'sub': 'active-sub', 'email': user.email}, status=200,
-        )
-
-        result = self.backend.get_or_create_user('token', None, None)
-
-        self.assertEqual(result, user)
+    @override_settings(**OIDC_TEST_SETTINGS, OIDC_AUTO_ACTIVATE_GROUPS=['/trusted', '/also-required'])
+    def test_create_user_auto_activate_requires_all_configured_groups(self):
+        # AND, not OR -- same semantics as OIDC_REQUIRED_GROUPS.
+        user = self.backend.create_user({'email': 'a@example.com', 'groups': ['/trusted']})
+        self.assertFalse(user.is_active)
 
 
 class TestOIDCDRFAuthenticationStacking(TestCase):
@@ -284,3 +288,93 @@ class TestLoginPageWithoutOIDC(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertFalse(response.context['oidc_login_enabled'])
         self.assertNotIn(b'oidc/authenticate', response.content)
+
+
+@override_settings(**OIDC_TEST_SETTINGS, OIDC_ENABLED=True)
+class TestOidcContextProcessorNextParam(TestCase):
+    """next is read from POST as well as GET: after a failed local-password submission the login
+    form re-renders via POST, carrying `next` forward as a hidden field -- GET-only silently
+    dropped the OIDC button's redirect destination on that re-render.
+
+    reverse('oidc_authentication_init') is patched out: the real URL pattern only exists when
+    OIDC_ENABLED was true at urls.py's own import time (settings-module-import time, before any
+    test's override_settings runs -- see TestOIDCDRFAuthenticationStacking's docstring for the
+    same constraint elsewhere), which isn't the case in this test run. Irrelevant to what's under
+    test here (the next-param precedence logic), so a fixed dummy return is fine.
+    """
+
+    def _oidc_login_url(self, request):
+        with patch('observation_portal.accounts.context_processors.reverse', return_value='/oidc/authenticate/'):
+            return oidc_context_processor(request)['oidc_login_url']
+
+    def test_reads_next_from_get(self):
+        request = RequestFactory().get('/accounts/login/?next=/foo')
+        self.assertIn('next=%2Ffoo', self._oidc_login_url(request))
+
+    def test_reads_next_from_post(self):
+        request = RequestFactory().post('/accounts/login/', {'next': '/foo'})
+        self.assertIn('next=%2Ffoo', self._oidc_login_url(request))
+
+    def test_post_takes_precedence_over_get(self):
+        # Matches Django's own AuthenticationForm/LoginView convention of trusting the submitted
+        # form field over the URL on a POST.
+        request = RequestFactory().post('/accounts/login/?next=/from-get', {'next': '/from-post'})
+        self.assertIn('next=%2Ffrom-post', self._oidc_login_url(request))
+
+
+class TestOidcUsernameFromEmail(TestCase):
+    def test_uses_email_local_part(self):
+        self.assertEqual(oidc_username_from_email('alice@example.com'), 'alice')
+
+    def test_sanitizes_disallowed_characters(self):
+        self.assertEqual(oidc_username_from_email('a+lice!!@example.com'), 'a+lice')
+
+    def test_falls_back_for_missing_email(self):
+        self.assertEqual(oidc_username_from_email(''), 'oidc-user')
+        self.assertEqual(oidc_username_from_email(None), 'oidc-user')
+
+    def test_deduplicates_on_collision(self):
+        blend_user(user_params={'username': 'alice'})
+
+        self.assertEqual(oidc_username_from_email('alice@example.com'), 'alice2')
+
+    def test_deduplicates_multiple_collisions(self):
+        blend_user(user_params={'username': 'alice'})
+        blend_user(user_params={'username': 'alice2'})
+
+        self.assertEqual(oidc_username_from_email('alice@example.com'), 'alice3')
+
+
+class TestObservationPortalOIDCCallbackView(TestCase):
+    """login_failure's job: distinguish "pending activation" (self.user set but inactive) from
+    every other failure (self.user is None -- bad state, rejected claims, provider error, ...),
+    which the base view's plain redirect can't do."""
+
+    @staticmethod
+    def _view_with_user(user):
+        view = ObservationPortalOIDCCallbackView()
+        view.request = RequestFactory().get('/oidc/callback/')
+        view.user = user
+        return view
+
+    def test_renders_pending_activation_page_for_inactive_user(self):
+        user = blend_user(user_params={'is_active': False})
+
+        response = self._view_with_user(user).login_failure()
+
+        self.assertEqual(response.status_code, 403)
+        self.assertIn(b'pending activation', response.content.lower())
+
+    def test_falls_back_to_default_failure_for_no_user(self):
+        response = self._view_with_user(None).login_failure()
+
+        self.assertEqual(response.status_code, 302)
+
+    def test_falls_back_to_default_failure_for_active_user(self):
+        # Shouldn't normally happen -- login_failure is only reached when login didn't succeed --
+        # but verify it doesn't wrongly render the pending-activation page for an active user.
+        user = blend_user()
+
+        response = self._view_with_user(user).login_failure()
+
+        self.assertEqual(response.status_code, 302)
