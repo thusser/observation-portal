@@ -124,18 +124,23 @@ MIDDLEWARE = [
 
 ROOT_URLCONF = 'observation_portal.urls'
 
+TEMPLATE_CONTEXT_PROCESSORS = [
+    'django.template.context_processors.debug',
+    'django.template.context_processors.request',
+    'django.contrib.auth.context_processors.auth',
+    'django.contrib.messages.context_processors.messages',
+    # No-ops (returns oidc_login_enabled=False) when OIDC_ENABLED is false, so this is always safe
+    # to register.
+    'observation_portal.accounts.context_processors.oidc',
+]
+
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
         'DIRS': [os.path.join(BASE_DIR, 'templates')],
         'APP_DIRS': True,
         'OPTIONS': {
-            'context_processors': [
-                'django.template.context_processors.debug',
-                'django.template.context_processors.request',
-                'django.contrib.auth.context_processors.auth',
-                'django.contrib.messages.context_processors.messages',
-            ],
+            'context_processors': TEMPLATE_CONTEXT_PROCESSORS,
         },
     },
 ]
@@ -207,6 +212,32 @@ AUTHENTICATION_BACKENDS = [
     'django.contrib.auth.backends.ModelBackend',
     'oauth2_provider.backends.OAuth2Backend',
 ]
+
+# OIDC login (any compliant provider -- Keycloak, or otherwise), additive on top of local
+# username/password auth. OIDC_ENABLED unset/false ⇒ none of the settings below are read, no new
+# code path is reachable, and this behaves exactly like a build without OIDC support at all.
+OIDC_ENABLED = os.getenv('OIDC_ENABLED', 'False').lower() == 'true'
+
+if OIDC_ENABLED:
+    OIDC_RP_CLIENT_ID = os.environ['OIDC_RP_CLIENT_ID']
+    OIDC_RP_CLIENT_SECRET = os.environ['OIDC_RP_CLIENT_SECRET']
+    OIDC_OP_AUTHORIZATION_ENDPOINT = os.environ['OIDC_OP_AUTHORIZATION_ENDPOINT']
+    OIDC_OP_TOKEN_ENDPOINT = os.environ['OIDC_OP_TOKEN_ENDPOINT']
+    OIDC_OP_USER_ENDPOINT = os.environ['OIDC_OP_USER_ENDPOINT']
+    OIDC_OP_JWKS_ENDPOINT = os.environ['OIDC_OP_JWKS_ENDPOINT']
+    OIDC_RP_SIGN_ALGO = os.getenv('OIDC_RP_SIGN_ALGO', 'RS256')
+    OIDC_RP_SCOPES = os.getenv('OIDC_RP_SCOPES', 'openid email')
+    # Optional: only providers that expose RP-Initiated Logout need this (see accounts/oidc.py's
+    # oidc_op_logout_url). Left unset, /oidc/logout/ still ends the local Django session.
+    OIDC_OP_LOGOUT_ENDPOINT = os.getenv('OIDC_OP_LOGOUT_ENDPOINT', '')
+    OIDC_OP_LOGOUT_URL_METHOD = 'observation_portal.accounts.oidc.oidc_op_logout_url'
+    # Cosmetic only -- shown on the login button ("Log in with {label}"); has no bearing on which
+    # provider is actually contacted (that's entirely the OIDC_OP_* endpoints above).
+    OIDC_PROVIDER_LABEL = os.getenv('OIDC_PROVIDER_LABEL', 'OIDC')
+
+    AUTHENTICATION_BACKENDS = AUTHENTICATION_BACKENDS + [
+        'observation_portal.accounts.oidc.ObservationPortalOIDCBackend',
+    ]
 
 OAUTH2_PROVIDER = {
     'ACCESS_TOKEN_EXPIRE_SECONDS': 86400 * 30 * 24,  # 2 years
@@ -309,6 +340,16 @@ REST_FRAMEWORK = {
         'requestgroups.validate': os.getenv('REQUESTGROUPS_VALIDATE_DEFAULT_THROTTLE', '20000/day')
     }
 }
+
+if OIDC_ENABLED:
+    # Must come after OAuth2Authentication: DRF uses the first authenticator that returns a
+    # non-None result, and mozilla-django-oidc's DRF authenticator validates every bearer token it
+    # sees against the OIDC provider's userinfo endpoint over the network (no cheap local
+    # issuer-based defer) -- this ordering is what keeps portal-issued OAuth2 tokens from ever
+    # reaching it.
+    REST_FRAMEWORK['DEFAULT_AUTHENTICATION_CLASSES'] = REST_FRAMEWORK['DEFAULT_AUTHENTICATION_CLASSES'] + (
+        'mozilla_django_oidc.contrib.drf.OIDCAuthentication',
+    )
 
 LOGGING = {
     'version': 1,
